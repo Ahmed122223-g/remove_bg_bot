@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.vercel/
+user_settings.json
+.u2net/
+models/
+*.tmp
