@@ -102,22 +102,30 @@ def search_images_by_barcode(
             logger.error("المكتبة ddgs غير مثبتة. قم بتنفيذ: pip install ddgs")
             return [], None
 
-    product_name = resolve_product_title(barcode)
     urls = []
-
     search_queries = []
-    if product_name:
-        # البحث باستخدام اسم المنتج الدقيق
-        q = product_name
-        if extra_keywords:
-            q += f" {extra_keywords}"
-        search_queries.append(q)
+    resolved_name = None
 
-    # بحث احتياطي برقم الباركود
-    backup_q = f'"{barcode}"' if not product_name else f"{barcode} product"
-    if extra_keywords:
-        backup_q += f" {extra_keywords}"
-    search_queries.append(backup_q)
+    # 1. إذا كان اسم المنتج معروفاً مسبقاً (من شيت الإكسل مثلاً)، فهو الأولوية القصوى والمطلقة
+    if extra_keywords and len(extra_keywords.strip()) > 3:
+        clean_kw = extra_keywords.strip()
+        search_queries.append(clean_kw)
+        resolved_name = clean_kw
+        logger.info(f"استخدام اسم المنتج الأساسي الموفر: '{clean_kw}'")
+
+    # 2. إذا لم يكن متوفراً اسم، نحاول استخراجه من الباركود
+    else:
+        product_name = resolve_product_title(barcode)
+        if product_name:
+            search_queries.append(product_name)
+            resolved_name = product_name
+
+    # 3. محاولات إضافية بدمج الباركود واسم المنتج إن وجد
+    if resolved_name:
+        search_queries.append(f"{resolved_name} {barcode}")
+    else:
+        search_queries.append(f'"{barcode}"')
+        search_queries.append(f"{barcode} product")
 
     for q in search_queries:
         logger.info(f"البحث عن صور للاستعلام: '{q}'")
@@ -131,12 +139,12 @@ def search_images_by_barcode(
         except Exception as e:
             logger.warning(f"خطأ في البحث عن الصور لـ '{q}': {e}")
 
-        # إذا وجدنا صوراً كافية للمنتج لا داعي للبحث الاحتياطي
+        # إذا وجدنا صوراً كافية للمنتج نكتفي
         if len(urls) >= 4:
             break
 
     logger.info(f"تم العثور على {len(urls)} رابط صورة للمنتج.")
-    return urls, product_name
+    return urls, resolved_name
 
 
 def download_image(url: str, timeout: int = 12) -> Optional[bytes]:
