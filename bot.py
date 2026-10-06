@@ -1,20 +1,20 @@
 """
 bot.py
 ======
-بوت تيليجرام لعزل خلفيات الصور والمنتجات بالذكاء الاصطناعي.
-مبني ومطور بناءً على تجربة مشروع nama/kayan لعزل صور الأزياء والمنتجات التجارية.
+بوت تيليجرام شامل لمعالجة صور المنتجات بالذكاء الاصطناعي.
+مستوحى ومطور من مشروع nama/kayan لمعالجة صور الأزياء والمتاجر الإلكترونية.
 
-المميزات:
-1. عزل خلفيات الصور بدقة فائقة مع تنعيم الحواف (Feathering) وحماية الفراغات (Fill Holes).
-2. موديلين متخصصين:
-   - موديل الأزياء والموديلز والملابس (u2net_human_seg)
-   - موديل المنتجات العامة والأشياء (u2net)
-3. خيارات مخرجات متعددة:
-   - خلفية بيضاء نقية (مناسبة لمنصات نون، جوميا، وأمازون)
-   - خلفية شفافة PNG (ملف عالي الدقة بدون ضغط)
-   - إرسال كلاهما معاً لتوفير الوقت
-4. أزرار تفاعلية تحت كل صورة لتغيير لون الخلفية فوراً (أبيض، أسود، شفاف، أو إعادة العزل بموديل مختلف).
-5. دعم استقبال الصور العادية أو الصور كملفات (Documents) بدون ضغط.
+الميزات الكاملة:
+1. عزل خلفيات الصور (Remove Background) بدقة فائقة.
+2. البحث عن صور المنتج بالباركود تلقائياً عبر DuckDuckGo Images.
+3. رفع شيتات Excel تحتوي بيانات البواركود لمعالجتها دفعة واحدة (Batch).
+4. إضافة لوجو الشركة (Watermark) تلقائياً بشفافية مناسبة.
+5. قص وتوحيد أبعاد الصور (Crop + Resize إلى 1000×1000).
+6. ضغط وتحسين الصور (Optimize) لأقل حجم ممكن.
+7. موديلين متخصصين بالذكاء الاصطناعي:
+   - الأزياء والملابس والأشخاص (u2net_human_seg)
+   - المنتجات العامة والأشياء الصلبة (u2net)
+8. أزرار تفاعلية تحت كل صورة للتعديل السريع.
 """
 
 import io
@@ -23,7 +23,8 @@ import sys
 import json
 import time
 import logging
-from typing import Dict, Any
+import threading
+from typing import Dict, Any, Optional
 
 # ضبط مخرجات الطرفية لدعم UTF-8 والرموز التعبيرية على ويندوز
 if sys.platform == "win32":
@@ -40,6 +41,29 @@ from telebot import types
 
 import config
 from image_processor import process_image_bytes
+from image_pipeline import run_full_pipeline
+
+# مسار ملف اللوجو الافتراضي
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
+
+# إعدادات Batch processing من شيتات Excel
+BATCH_SETTINGS = {
+    "max_per_barcode": 4,    # عدد الصور الأقصى لكل باركود
+    "remove_bg": True,       # عزل الخلفية
+    "add_logo": True,        # إضافة اللوجو
+    "crop_resize": True,     # القص والضبط
+    "optimize": True,        # الضغط والتحسين
+    "logo_position": "bottom_right",
+    "logo_opacity": 0.85,
+    "target_size": (1000, 1000),
+    "max_size_kb": 250,
+}
+
+# حالة المستخدمين أثناء عمليات المعالجة الطويلة (Batch)
+user_batch_state: Dict[int, Dict] = {}
+
+# انتظار رفع اللوجو من المستخدمين
+waiting_logo: Dict[int, bool] = {}
 
 # إعداد السجلات (Logging)
 logging.basicConfig(
@@ -165,15 +189,19 @@ def handle_start(message: types.Message):
     """الترحيب بالمستخدم وشرح طريقة العمل"""
     chat_id = message.chat.id
     cfg = get_user_config(chat_id)
+    logo_exists = os.path.exists(LOGO_PATH)
     text = (
-        "👋 <b>أهلاً بك في بوت عزل خلفيات الصور الذكي!</b>\n\n"
-        "✨ <b>كيف يعمل البوت؟</b>\n"
-        "فقط أرسل أي صورة هنا (سواء صورة عادية أو كملف Document للحفاظ على الدقة العالية)، "
-        "وسيقوم البوت بعزل الخلفية تلقائياً بدقة بالغة وبتقنية الذكاء الاصطناعي المستخدمة لمتاجر نون وجوميا.\n\n"
-        "⚙️ <b>إعداداتك الحالية:</b>\n"
-        f"• نمط المخرجات: <b>{'كلاهما (أبيض + شفاف)' if cfg['mode'] == 'both' else ('أبيض' if cfg['mode'] == 'white' else 'شفاف')}</b>\n"
-        f"• الموديل النشط: <b>{'الأزياء والملابس (u2net_human_seg)' if cfg['model'] == 'u2net_human_seg' else 'المنتجات العامة (u2net)'}</b>\n\n"
-        "👇 <i>يمكنك تعديل الإعدادات من الأزرار أدناه أو إرسال صورة للبدء فوراً:</i>"
+        "👋 <b>أهلاً بك في بوت معالجة صور المنتجات الذكي!</b>\n\n"
+        "🎯 <b>ما الذي يفعله البوت؟</b>\n"
+        "• 🔍 <b>بحث بالباركود:</b> أرسل باركود أي منتج وسيبحث عن صوره تلقائياً\n"
+        "• 📊 <b>شيتات Batch:</b> أرسل ملف Excel يحتوي بواركود للمعالجة الجماعية\n"
+        "• 🖼️ <b>عزل خلفية:</b> أرسل صورة مباشرة لعزل خلفيتها\n"
+        "• 🔖 <b>لوجو تلقائي:</b> يُضاف لوجو شركتك على كل صورة\n"
+        "• ✂️ <b>قص وضبط:</b> توحيد أبعاد 1000×1000 تلقائياً\n"
+        "• 💾 <b>ضغط وتحسين:</b> أقل حجم بأفضل جودة بصرية\n\n"
+        f"🔖 <b>اللوجو:</b> {'✅ محمل وجاهز' if logo_exists else '⚠️ لم يتم رفع لوجو بعد - استخدم /setlogo'} \n"
+        f"⚙️ <b>الموديل النشط:</b> {'الأزياء والملابس' if cfg['model'] == 'u2net_human_seg' else 'المنتجات العامة'}\n\n"
+        "👇 <i>يمكنك تعديل الإعدادات من الأزرار أدناه:</i>"
     )
     bot.send_message(chat_id, text, reply_markup=make_settings_markup(chat_id))
 
@@ -182,24 +210,62 @@ def handle_start(message: types.Message):
 def handle_settings(message: types.Message):
     """فتح لوحة الإعدادات"""
     chat_id = message.chat.id
-    cfg = get_user_config(chat_id)
-    text = (
-        "⚙️ <b>لوحة إعدادات عزل الخلفية:</b>\n\n"
-        "اختر نمط المخرجات المفضل والموديل المناسب لنوع صورك:"
+    bot.send_message(
+        chat_id,
+        "⚙️ <b>لوحة إعدادات معالجة الصور:</b>\n\nاختر نمط المخرجات والموديل المناسب:",
+        reply_markup=make_settings_markup(chat_id)
     )
-    bot.send_message(chat_id, text, reply_markup=make_settings_markup(chat_id))
+
+
+@bot.message_handler(commands=["setlogo"])
+def handle_setlogo(message: types.Message):
+    """تعيين انتظار رفع اللوجو من المستخدم"""
+    chat_id = message.chat.id
+    waiting_logo[chat_id] = True
+    bot.send_message(
+        chat_id,
+        "🔖 <b>رفع لوجو الشركة:</b>\n\n"
+        "أرسل ملف اللوجو الآن (PNG بخلفية شفافة مستحسن للحصول على أفضل نتيجة).\n"
+        "سيتم استخدامه تلقائياً على كل الصور المعالجة."
+    )
+
+
+@bot.message_handler(commands=["barcode"])
+def handle_barcode_cmd(message: types.Message):
+    """البحث عن صورة منتج بالباركود عبر الأمر /barcode"""
+    chat_id = message.chat.id
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(
+            chat_id,
+            "📦 <b>استخدام أمر الباركود:</b>\n\n"
+            "<code>/barcode 6223000511223</code>\n\n"
+            "أو ببساطة أرسل الباركود كرسالة نصية مباشرة وسيكتشفه البوت تلقائياً!"
+        )
+        return
+    barcode_text = parts[1].strip()
+    process_barcode(chat_id, barcode_text)
 
 
 @bot.message_handler(commands=["help"])
 def handle_help(message: types.Message):
     """رسالة المساعدة والتعليمات"""
     text = (
-        "📖 <b>دليل الاستخدام السريع:</b>\n\n"
-        "1. <b>إرسال الصور:</b> أرسل أي صورة مباشرة كصورة عادية أو أرسلها كملف (Send as File / Document) للحصول على أقصى دقة ممكنة.\n"
-        "2. <b>موديل الأزياء والملابس:</b> مخصص للموديلز، الملابس، الحجاب، البورتريهات لتجنب أي ثقوب أو تشويه في الأقمشة.\n"
-        "3. <b>موديل المنتجات العامة:</b> مخصص للأحذية، الشنط، الإكسسوارات، الأجهزة، والأدوات.\n"
-        "4. <b>الأزرار التفاعلية:</b> تحت كل نتيجة تظهر أزرار لتحويل الخلفية إلى أبيض، أسود، أو شفاف بضغطة زر دون إعادة الإرسال.\n\n"
-        "لضبط إعداداتك في أي وقت، استخدم الأمر /settings"
+        "📖 <b>دليل الاستخدام الكامل:</b>\n\n"
+        "<b>🔍 البحث بالباركود:</b>\n"
+        "• أرسل رقم الباركود كرسالة نصية مباشرة\n"
+        "• أو استخدم: <code>/barcode 6223000511223</code>\n\n"
+        "<b>📊 المعالجة الجماعية (Batch):</b>\n"
+        "• أرسل ملف Excel (.xlsx/.xls/.csv) يحتوي عمود باسم <b>barcode</b> أو <b>sku</b> أو <b>ID</b>\n"
+        "• سيقوم البوت بمعالجة كل صف تلقائياً وإرسال الصور\n\n"
+        "<b>🖼️ عزل الخلفية المباشر:</b>\n"
+        "• أرسل أي صورة مباشرة (عادية أو كملف) لعزل خلفيتها\n\n"
+        "<b>🔖 الأوامر المتاحة:</b>\n"
+        "• /start - الشاشة الرئيسية\n"
+        "• /setlogo - رفع لوجو شركتك\n"
+        "• /settings - إعدادات الموديل والمخرجات\n"
+        "• /barcode [رقم] - البحث بالباركود\n"
+        "• /help - هذه الرسالة"
     )
     bot.send_message(message.chat.id, text)
 
@@ -397,12 +463,197 @@ def process_and_reply(chat_id: int, image_bytes: bytes, original_filename: str =
             bot.send_message(chat_id, f"❌ حدث خطأ: {e}")
 
 
+# ===========================================================================
+# معالجة الباركود
+# ===========================================================================
+
+def process_barcode(chat_id: int, barcode: str, extra_keywords: str = ""):
+    """البحث عن صور المنتج بالباركود ومعالجتها كاملاً في خيط منفصل."""
+    def _run():
+        cfg = get_user_config(chat_id)
+        logo_path = LOGO_PATH if os.path.exists(LOGO_PATH) else None
+        status_msg = bot.send_message(
+            chat_id,
+            f"🔍 <b>جاري البحث عن صور الباركود:</b> <code>{barcode}</code>\n"
+            "⏳ قد تستغرق العملية دقيقة أو أكثر حسب عدد الصور..."
+        )
+
+        def notify(msg: str):
+            try:
+                bot.edit_message_text(
+                    f"🔍 <b>معالجة الباركود:</b> <code>{barcode}</code>\n\n⏳ {msg}",
+                    chat_id, status_msg.message_id
+                )
+            except Exception:
+                pass
+
+        result = run_full_pipeline(
+            barcode=barcode,
+            logo_path=logo_path,
+            extra_keywords=extra_keywords,
+            remove_bg=True,
+            bg_model=cfg.get("model", "u2net"),
+            add_logo=(logo_path is not None),
+            logo_position=BATCH_SETTINGS["logo_position"],
+            logo_opacity=BATCH_SETTINGS["logo_opacity"],
+            target_size=BATCH_SETTINGS["target_size"],
+            max_size_kb=BATCH_SETTINGS["max_size_kb"],
+            max_images=BATCH_SETTINGS["max_per_barcode"],
+            status_callback=notify
+        )
+
+        try:
+            bot.delete_message(chat_id, status_msg.message_id)
+        except Exception:
+            pass
+
+        if result["status"] == "error":
+            bot.send_message(chat_id, f"❌ <b>فشل البحث عن الباركود {barcode}:</b>\n{result['error']}")
+            return
+
+        images = result["images"]
+        bot.send_message(
+            chat_id,
+            f"✅ <b>تمت معالجة الباركود:</b> <code>{barcode}</code>\n"
+            f"📦 عدد الصور: {len(images)} صورة جاهزة للرفع على المتاجر"
+        )
+
+        for idx, img_data in enumerate(images, 1):
+            final_bytes = img_data["final_bytes"]
+            ext = img_data["final_ext"]
+            size_kb = img_data["size_kb"]
+            img_token = cache_image(img_data.get("original_bytes", final_bytes))
+
+            doc_file = io.BytesIO(final_bytes)
+            doc_file.name = f"{barcode}_{idx}.{ext}"
+
+            try:
+                bot.send_document(
+                    chat_id,
+                    doc_file,
+                    caption=(
+                        f"📦 <b>باركود:</b> <code>{barcode}</code> | <b>صورة {idx}/{len(images)}</b>\n"
+                        f"💾 الحجم: <b>{size_kb} كيلوبايت</b>\n"
+                        f"📐 الأبعاد: 1000×1000 بكسل"
+                    ),
+                    reply_markup=make_action_markup(img_token, cfg.get("model", "u2net"))
+                )
+            except Exception as e:
+                logger.error(f"فشل إرسال صورة {idx}: {e}")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+
+# ===========================================================================
+# معالجة شيتات Excel (Batch)
+# ===========================================================================
+
+def process_excel_batch(chat_id: int, file_bytes: bytes, filename: str):
+    """قراءة ملف Excel أو CSV واستخراج البواركود ومعالجتها بالتسلسل."""
+    def _run():
+        import openpyxl
+        import csv
+
+        barcodes = []
+
+        try:
+            if filename.lower().endswith(".csv"):
+                text = file_bytes.decode("utf-8-sig", errors="replace")
+                reader = csv.DictReader(io.StringIO(text))
+                headers = [h.lower().strip() for h in (reader.fieldnames or [])]
+                barcode_col = next((h for h in headers if any(k in h for k in ["barcode", "sku", "id", "كود", "باركود"])), None)
+                if not barcode_col:
+                    barcode_col = headers[0] if headers else None
+                if barcode_col:
+                    for row in reader:
+                        val = str(row.get(barcode_col, "")).strip()
+                        if val and val not in ("nan", "", "None"):
+                            barcodes.append(val)
+            else:
+                wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+                ws = wb.active
+                headers = [str(ws.cell(1, c).value or "").lower().strip() for c in range(1, ws.max_column + 1)]
+                barcode_col_idx = None
+                for ci, h in enumerate(headers, 1):
+                    if any(k in h for k in ["barcode", "sku", "id", "كود", "باركود"]):
+                        barcode_col_idx = ci
+                        break
+                if not barcode_col_idx:
+                    barcode_col_idx = 1
+                for r in range(2, ws.max_row + 1):
+                    val = ws.cell(r, barcode_col_idx).value
+                    if val:
+                        val = str(val).strip().split(".")[0]  # إزالة .0 من الأرقام
+                        if val and val not in ("None", "", "nan"):
+                            barcodes.append(val)
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ فشل قراءة الملف: {e}")
+            return
+
+        if not barcodes:
+            bot.send_message(chat_id, "⚠️ لم يتم العثور على بيانات باركود في الملف.\nتأكد من وجود عمود باسم barcode أو sku أو ID.")
+            return
+
+        bot.send_message(
+            chat_id,
+            f"📊 <b>تم قراءة {len(barcodes)} باركود من الملف.</b>\n"
+            f"⏳ جاري المعالجة... (سيتم إرسال النتائج باركود باركود)"
+        )
+
+        for idx, barcode in enumerate(barcodes, 1):
+            bot.send_chat_action(chat_id, "upload_document")
+            try:
+                process_barcode(chat_id, barcode)
+                time.sleep(3)  # فترة انتظار بين كل باركود لتجنب الحجب
+            except Exception as e:
+                logger.error(f"خطأ في معالجة الباركود {barcode}: {e}")
+                bot.send_message(chat_id, f"⚠️ فشل الباركود {barcode}: {e}")
+
+        bot.send_message(chat_id, f"🎉 <b>اكتملت المعالجة الجماعية!</b>\nتمت معالجة {len(barcodes)} باركود بنجاح.")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+
+# ===========================================================================
+# معالجة الرسائل النصية (اكتشاف الباركود تلقائياً)
+# ===========================================================================
+
+@bot.message_handler(content_types=["text"])
+def handle_text(message: types.Message):
+    """اكتشاف الباركود تلقائياً من الرسائل النصية."""
+    import re
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+
+    # اكتشاف الباركود: رقم من 8 إلى 14 خانة
+    barcode_match = re.fullmatch(r'[\d]{8,14}', text)
+    if barcode_match:
+        process_barcode(chat_id, text)
+        return
+
+    # رسالة توجيه للأوامر المتاحة
+    bot.send_message(
+        chat_id,
+        "💡 لم أتعرف على هذا الأمر.\n\n"
+        "• أرسل <b>رقم الباركود</b> (8-14 رقم) للبحث عن صور المنتج تلقائياً\n"
+        "• أرسل <b>صورة</b> لعزل خلفيتها\n"
+        "• أرسل <b>ملف Excel</b> يحتوي بواركود للمعالجة الجماعية\n"
+        "• استخدم /help لمزيد من المعلومات"
+    )
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message: types.Message):
-    """استقبال الصور المضغوطة العادية من تيليجرام"""
+    """استقبال الصور المضغوطة."""
     chat_id = message.chat.id
+    # إذا كان المستخدم في وضع رفع اللوجو
+    if waiting_logo.get(chat_id):
+        waiting_logo.pop(chat_id, None)
+        bot.send_message(chat_id, "⚠️ يرجى إرسال اللوجو كملف (Send as File/Document) وليس صورة مضغوطة للحفاظ على جودة الشفافية.")
+        return
     try:
-        # جلب أعلى دقة للصورة المرسلة
         photo = message.photo[-1]
         file_info = bot.get_file(photo.file_id)
         image_bytes = bot.download_file(file_info.file_path)
@@ -414,26 +665,63 @@ def handle_photo(message: types.Message):
 
 @bot.message_handler(content_types=["document"])
 def handle_document(message: types.Message):
-    """استقبال الصور المرسلة كملف للحفاظ على الجودة الكاملة"""
+    """استقبال الصور والملفات المرسلة بدون ضغط."""
     chat_id = message.chat.id
     doc = message.document
-
-    # التحقق من أن الملف صورة
     mime = (doc.mime_type or "").lower()
     fname = (doc.file_name or "").lower()
-    valid_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
 
-    if not (mime.startswith("image/") or fname.endswith(valid_exts)):
-        bot.reply_to(message, "⚠️ الملف المرسل ليس صورة. يرجى إرسال ملف بصيغة (JPG, PNG, WEBP, BMP).")
+    # 1. رفع لوجو
+    if waiting_logo.get(chat_id):
+        waiting_logo.pop(chat_id, None)
+        if mime.startswith("image/") or fname.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            try:
+                file_info = bot.get_file(doc.file_id)
+                logo_bytes = bot.download_file(file_info.file_path)
+                with open(LOGO_PATH, "wb") as f:
+                    f.write(logo_bytes)
+                bot.send_message(
+                    chat_id,
+                    "✅ <b>تم حفظ اللوجو بنجاح!</b>\n"
+                    "سيُضاف تلقائياً على كل الصور المعالجة من الآن فصاعداً.\n"
+                    "يمكنك تغييره في أي وقت عبر /setlogo"
+                )
+            except Exception as e:
+                bot.send_message(chat_id, f"❌ فشل حفظ اللوجو: {e}")
+        else:
+            bot.send_message(chat_id, "⚠️ الملف ليس صورة. يرجى إرسال ملف PNG أو JPG.")
         return
 
-    try:
-        file_info = bot.get_file(doc.file_id)
-        image_bytes = bot.download_file(file_info.file_path)
-        process_and_reply(chat_id, image_bytes, original_filename=doc.file_name or "document.png")
-    except Exception as e:
-        logger.error(f"فشل تنزيل المستند: {e}")
-        bot.send_message(chat_id, f"❌ تعذر تنزيل الملف: {e}")
+    # 2. ملف Excel للمعالجة الجماعية
+    excel_exts = (".xlsx", ".xls", ".csv")
+    if fname.endswith(excel_exts) or mime in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                               "application/vnd.ms-excel",
+                                               "text/csv"):
+        try:
+            file_info = bot.get_file(doc.file_id)
+            file_bytes = bot.download_file(file_info.file_path)
+            bot.send_message(
+                chat_id,
+                f"📊 <b>تم استلام ملف:</b> <code>{doc.file_name}</code>\n"
+                "⏳ جاري قراءة البواركود وبدء المعالجة الجماعية..."
+            )
+            process_excel_batch(chat_id, file_bytes, fname)
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ فشل تنزيل الملف: {e}")
+        return
+
+    # 3. صورة عادية
+    valid_img_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
+    if mime.startswith("image/") or fname.endswith(valid_img_exts):
+        try:
+            file_info = bot.get_file(doc.file_id)
+            image_bytes = bot.download_file(file_info.file_path)
+            process_and_reply(chat_id, image_bytes, original_filename=doc.file_name or "document.png")
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ تعذر تنزيل الملف: {e}")
+        return
+
+    bot.reply_to(message, "⚠️ نوع الملف غير مدعوم. يرجى إرسال صورة أو ملف Excel أو CSV.")
 
 
 def main():
