@@ -556,67 +556,178 @@ def process_barcode(chat_id: int, barcode: str, extra_keywords: str = ""):
 # ===========================================================================
 
 def process_excel_batch(chat_id: int, file_bytes: bytes, filename: str):
-    """قراءة ملف Excel أو CSV واستخراج البواركود ومعالجتها بالتسلسل."""
+    """
+    قراءة ملف Excel (مثل Product-product.template.xlsx) واستخراج المنتجات والباركود:
+    1. البحث عن صور كل منتج وعزلها وتعديل أبعادها وضغطها.
+    2. إدراج الصورة مباشرة في الشيت داخل صف المنتج.
+    3. إرسال صور كل منتج للمستخدم + إعادة إرسال شيت الإكسل مكتملاً بالصور!
+    """
     def _run():
         import openpyxl
-        import csv
+        from openpyxl.drawing.image import Image as XLImage
+        from PIL import Image as PILImage
+        import tempfile
+        import shutil
 
-        barcodes = []
+        temp_dir = tempfile.mkdtemp(prefix="excel_batch_")
+        cfg = get_user_config(chat_id)
+        user_logo = user_logos.get(chat_id)
+        logo_path = user_logo if (user_logo and os.path.exists(user_logo)) else (LOGO_PATH if os.path.exists(LOGO_PATH) else None)
 
         try:
-            if filename.lower().endswith(".csv"):
-                text = file_bytes.decode("utf-8-sig", errors="replace")
-                reader = csv.DictReader(io.StringIO(text))
-                headers = [h.lower().strip() for h in (reader.fieldnames or [])]
-                barcode_col = next((h for h in headers if any(k in h for k in ["barcode", "sku", "id", "كود", "باركود"])), None)
-                if not barcode_col:
-                    barcode_col = headers[0] if headers else None
-                if barcode_col:
-                    for row in reader:
-                        val = str(row.get(barcode_col, "")).strip()
-                        if val and val not in ("nan", "", "None"):
-                            barcodes.append(val)
-            else:
-                wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-                ws = wb.active
-                headers = [str(ws.cell(1, c).value or "").lower().strip() for c in range(1, ws.max_column + 1)]
-                barcode_col_idx = None
-                for ci, h in enumerate(headers, 1):
-                    if any(k in h for k in ["barcode", "sku", "id", "كود", "باركود"]):
-                        barcode_col_idx = ci
-                        break
-                if not barcode_col_idx:
-                    barcode_col_idx = 1
-                for r in range(2, ws.max_row + 1):
-                    val = ws.cell(r, barcode_col_idx).value
-                    if val:
-                        val = str(val).strip().split(".")[0]  # إزالة .0 من الأرقام
-                        if val and val not in ("None", "", "nan"):
-                            barcodes.append(val)
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+            ws = wb.active
+
+            # البحث عن أعمدة الباركود واسم المنتج والصورة
+            headers = [str(ws.cell(1, c).value or "").lower().strip() for c in range(1, ws.max_column + 1)]
+            
+            barcode_col = next((c for c, h in enumerate(headers, 1) if any(k in h for k in ["barcode", "باركود", "كود"])), None)
+            name_col = next((c for c, h in enumerate(headers, 1) if any(k in h for k in ["name", "اسم", "title"])), None)
+            
+            # عمود الصورة: نبحث عن عمود فيه image/photo/صورة، أو العمود الفارغ رقم 8، أو إضافة عمود جديد
+            image_col = next((c for c, h in enumerate(headers, 1) if any(k in h for k in ["image", "صورة", "photo", "pic"])), None)
+            if not image_col:
+                # التحقق إذا كان العمود 8 فارغاً كما في نموذج المستخدم
+                if len(headers) >= 8 and not headers[7]:
+                    image_col = 8
+                    ws.cell(1, 8).value = "Product Image"
+                else:
+                    # إضافة عمود جديد في النهاية للصور
+                    image_col = ws.max_column + 1
+                    ws.cell(1, image_col).value = "Product Image"
+
+            if not barcode_col:
+                barcode_col = 9 if ws.max_column >= 9 else 1
+
+            # ضبط عرض عمود الصورة
+            col_letter = openpyxl.utils.get_column_letter(image_col)
+            ws.column_dimensions[col_letter].width = 24
+
+            # جمع الصفوف المراد معالجتها
+            items_to_process = []
+            for r in range(2, ws.max_row + 1):
+                raw_barcode = ws.cell(r, barcode_col).value
+                if raw_barcode:
+                    bc_clean = str(raw_barcode).strip().split(".")[0]
+                    if bc_clean and bc_clean not in ("None", "", "nan"):
+                        prod_name = str(ws.cell(r, name_col).value or "").strip() if name_col else ""
+                        items_to_process.append({
+                            "row": r,
+                            "barcode": bc_clean,
+                            "name": prod_name
+                        })
+
+            if not items_to_process:
+                bot.send_message(chat_id, "⚠️ لم يتم العثور على أرقام باركود في الشيت.")
+                return
+
+            bot.send_message(
+                chat_id,
+                f"📊 <b>تم قراءة {len(items_to_process)} منتج من الشيت.</b>\n"
+                f"⏳ جاري معالجة الصور بالذكاء الاصطناعي وإدراجها مباشرة داخل الإكسل..."
+            )
+
+            success_count = 0
+
+            for idx, item in enumerate(items_to_process, 1):
+                row_idx = item["row"]
+                barcode = item["barcode"]
+                item_name = item["name"]
+
+                bot.send_chat_action(chat_id, "upload_document")
+
+                # تشغيل خط المعالجة
+                res = run_full_pipeline(
+                    barcode=barcode,
+                    logo_path=logo_path,
+                    extra_keywords=item_name,
+                    remove_bg=True,
+                    bg_model=cfg.get("model", "u2net"),
+                    add_logo=(logo_path is not None),
+                    logo_position=BATCH_SETTINGS["logo_position"],
+                    logo_opacity=BATCH_SETTINGS["logo_opacity"],
+                    target_size=BATCH_SETTINGS["target_size"],
+                    target_format=BATCH_SETTINGS["target_format"],
+                    min_size_kb=BATCH_SETTINGS["min_size_kb"],
+                    max_size_kb=BATCH_SETTINGS["max_size_kb"],
+                    max_images=BATCH_SETTINGS["max_per_barcode"],
+                    status_callback=None
+                )
+
+                if res.get("status") == "success" and res.get("images"):
+                    images = res["images"]
+                    best_img_data = images[0]
+                    
+                    # 1. إدراج الصورة في ملف الإكسل
+                    try:
+                        # تحويل الصورة إلى PNG مؤقتة ليدعمها openpyxl بدون مشاكل
+                        pil_img = PILImage.open(io.BytesIO(best_img_data["final_bytes"]))
+                        img_path = os.path.join(temp_dir, f"row_{row_idx}.png")
+                        
+                        # تغيير الحجم لتناسب خلية الإكسل بشكل مريح وأنيق (120×120 بكسل)
+                        pil_img.resize((120, 120), PILImage.Resampling.LANCZOS).save(img_path, format="PNG")
+                        
+                        xl_img = XLImage(img_path)
+                        xl_img.width = 120
+                        xl_img.height = 120
+
+                        # ضبط ارتفاع صف الإكسل
+                        ws.row_dimensions[row_idx].height = 95
+                        cell_coord = f"{col_letter}{row_idx}"
+                        ws.add_image(xl_img, cell_coord)
+                    except Exception as e:
+                        logger.error(f"خطأ في إدراج الصورة في إكسل للصف {row_idx}: {e}")
+
+                    # 2. إرسال الصورة في تيليجرام كملف WebP
+                    try:
+                        doc_file = io.BytesIO(best_img_data["final_bytes"])
+                        doc_file.name = f"{barcode}_1.{best_img_data['final_ext']}"
+                        bot.send_document(
+                            chat_id,
+                            doc_file,
+                            caption=(
+                                f"📦 <b>منتج {idx}/{len(items_to_process)}:</b> <code>{barcode}</code>\n"
+                                f"🏷️ {item_name or res.get('product_name') or ''}\n"
+                                f"💾 الحجم: <b>{best_img_data['size_kb']} KB</b> (WebP) | 📐 800×800"
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"خطأ في إرسال صورة تيليجرام: {e}")
+
+                    success_count += 1
+                else:
+                    bot.send_message(chat_id, f"⚠️ لم يتم العثور على صورة مناسبة للمنتج: <code>{barcode}</code> ({item_name})")
+
+                time.sleep(2)  # فاصل زمني لتجنب الحجب
+
+            # حفظ وإرسال ملف الإكسل النهائي
+            out_excel_path = os.path.join(temp_dir, f"Updated_{filename}")
+            if not out_excel_path.endswith(".xlsx"):
+                out_excel_path += ".xlsx"
+            wb.save(out_excel_path)
+
+            with open(out_excel_path, "rb") as f:
+                updated_excel_bytes = f.read()
+
+            excel_file_to_send = io.BytesIO(updated_excel_bytes)
+            excel_file_to_send.name = f"Updated_{filename if filename.endswith('.xlsx') else filename + '.xlsx'}"
+
+            bot.send_document(
+                chat_id,
+                excel_file_to_send,
+                caption=(
+                    f"🎉 <b>اكتملت المعالجة بنجاح!</b>\n\n"
+                    f"📊 إجمالي المنتجات: {len(items_to_process)}\n"
+                    f"✅ تم وضع صور {success_count} منتج داخل الشيت مباشرة.\n"
+                    f"📁 تم إرفاق ملف الإكسل المحدث أعلاه."
+                )
+            )
+
         except Exception as e:
-            bot.send_message(chat_id, f"❌ فشل قراءة الملف: {e}")
-            return
-
-        if not barcodes:
-            bot.send_message(chat_id, "⚠️ لم يتم العثور على بيانات باركود في الملف.\nتأكد من وجود عمود باسم barcode أو sku أو ID.")
-            return
-
-        bot.send_message(
-            chat_id,
-            f"📊 <b>تم قراءة {len(barcodes)} باركود من الملف.</b>\n"
-            f"⏳ جاري المعالجة... (سيتم إرسال النتائج باركود باركود)"
-        )
-
-        for idx, barcode in enumerate(barcodes, 1):
-            bot.send_chat_action(chat_id, "upload_document")
-            try:
-                process_barcode(chat_id, barcode)
-                time.sleep(3)  # فترة انتظار بين كل باركود لتجنب الحجب
-            except Exception as e:
-                logger.error(f"خطأ في معالجة الباركود {barcode}: {e}")
-                bot.send_message(chat_id, f"⚠️ فشل الباركود {barcode}: {e}")
-
-        bot.send_message(chat_id, f"🎉 <b>اكتملت المعالجة الجماعية!</b>\nتمت معالجة {len(barcodes)} باركود بنجاح.")
+            logger.error(f"فشل معالجة شيت الإكسل: {e}")
+            bot.send_message(chat_id, f"❌ حدث خطأ أثناء معالجة ملف الإكسل: {e}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
