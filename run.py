@@ -54,7 +54,10 @@ def check_and_install_dependencies():
         ("numpy", "numpy"),
         ("scipy", "scipy"),
         ("dotenv", "python-dotenv"),
-        ("onnxruntime", "onnxruntime")
+        ("onnxruntime", "onnxruntime"),
+        ("ddgs", "ddgs"),
+        ("openpyxl", "openpyxl"),
+        ("requests", "requests")
     ]
 
     missing = []
