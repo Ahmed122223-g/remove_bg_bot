@@ -512,9 +512,11 @@ def process_barcode(chat_id: int, barcode: str, extra_keywords: str = ""):
             return
 
         images = result["images"]
+        prod_title = result.get("product_name")
+        prod_info = f"\n🏷️ <b>المنتج:</b> {prod_title}" if prod_title else ""
         bot.send_message(
             chat_id,
-            f"✅ <b>تمت معالجة الباركود:</b> <code>{barcode}</code>\n"
+            f"✅ <b>تمت معالجة الباركود:</b> <code>{barcode}</code>{prod_info}\n"
             f"📦 عدد الصور: {len(images)} صورة جاهزة للرفع على المتاجر"
         )
 

@@ -37,17 +37,59 @@ JPEG_QUALITY = 82
 
 
 # ===========================================================================
-# 1. البحث عن الصور بالباركود
+# 1. البحث عن اسم المنتج والصور بالباركود
 # ===========================================================================
+
+BLACKLIST_DOMAINS = [
+    "barcode lookup", "17track", "search upc", "free barcode",
+    "upcitemdb", "barcodable", "ecomsource", "buycott", "checkcosmetic",
+    "track24", "parcelsapp"
+]
+
+def resolve_product_title(barcode: str) -> Optional[str]:
+    """
+    استخراج اسم المنتج الحقيقي من محركات البحث باستخدام رقم الباركود.
+    """
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        return None
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(barcode, max_results=8))
+            for r in results:
+                title = r.get("title", "")
+                href = r.get("href", "")
+
+                # تخطي المواقع التافهة أو صفحات تتبع الطرود العامة
+                if any(bad in title.lower() or bad in href.lower() for bad in BLACKLIST_DOMAINS):
+                    continue
+
+                if title and len(title.strip()) > 4:
+                    # تنظيف العنوان من الإضافات التجارية مثل أسماء المتاجر والأسعار
+                    import re
+                    clean = re.split(r' [–—|] | - |\bPrice\b|\bReviews\b|\bSpecs\b|\bOffers\b', title, flags=re.IGNORECASE)[0].strip()
+                    clean = re.sub(r'^[^\w]+|[^\w)]+$', '', clean)
+                    if len(clean) > 3:
+                        logger.info(f"تم التعرف على المنتج: '{clean}' للباركود: {barcode}")
+                        return clean
+    except Exception as e:
+        logger.warning(f"تعذر استخراج اسم المنتج عبر البحث النصي: {e}")
+
+    return None
+
 
 def search_images_by_barcode(
     barcode: str,
     extra_keywords: str = "",
-    max_results: int = 8
-) -> List[str]:
+    max_results: int = 10
+) -> Tuple[List[str], Optional[str]]:
     """
-    البحث عن صور المنتج باستخدام الباركود عبر DuckDuckGo Images.
-    يُرجع قائمة بروابط الصور المجدية.
+    البحث الذكي عن صور المنتج:
+    1. استخراج اسم المنتج الحقيقي من الباركود.
+    2. البحث عن صور المنتج بدقة باستخدام اسمه والباركود.
+    يُرجع (قائمة بروابط الصور, اسم المنتج المكتشف إن وجد).
     """
     try:
         from ddgs import DDGS
@@ -56,40 +98,43 @@ def search_images_by_barcode(
             from duckduckgo_search import DDGS
         except ImportError:
             logger.error("المكتبة ddgs غير مثبتة. قم بتنفيذ: pip install ddgs")
-            return []
+            return [], None
 
-    query = f"{barcode} product"
-    if extra_keywords:
-        query += f" {extra_keywords}"
-
-    logger.info(f"البحث عن صور: '{query}'")
+    product_name = resolve_product_title(barcode)
     urls = []
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.images(
-                query,
-                max_results=max_results,
-                size="Medium",
-                type_image="photo"
-            )
-            for r in results:
-                url = r.get("image", "")
-                if url and url.startswith("http"):
-                    urls.append(url)
-    except Exception as e:
-        logger.warning(f"خطأ في البحث عبر DuckDuckGo: {e}. محاولة بدون فلاتر...")
+
+    search_queries = []
+    if product_name:
+        # البحث باستخدام اسم المنتج الدقيق
+        q = product_name
+        if extra_keywords:
+            q += f" {extra_keywords}"
+        search_queries.append(q)
+
+    # بحث احتياطي برقم الباركود
+    backup_q = f'"{barcode}"' if not product_name else f"{barcode} product"
+    if extra_keywords:
+        backup_q += f" {extra_keywords}"
+    search_queries.append(backup_q)
+
+    for q in search_queries:
+        logger.info(f"البحث عن صور للاستعلام: '{q}'")
         try:
             with DDGS() as ddgs:
-                results = ddgs.images(query, max_results=max_results)
+                results = list(ddgs.images(q, max_results=max_results))
                 for r in results:
-                    url = r.get("image", "")
-                    if url and url.startswith("http"):
-                        urls.append(url)
-        except Exception as e2:
-            logger.error(f"فشل البحث تماماً: {e2}")
+                    u = r.get("image", "")
+                    if u and u.startswith("http") and u not in urls:
+                        urls.append(u)
+        except Exception as e:
+            logger.warning(f"خطأ في البحث عن الصور لـ '{q}': {e}")
 
-    logger.info(f"تم العثور على {len(urls)} رابط صورة.")
-    return urls
+        # إذا وجدنا صوراً كافية للمنتج لا داعي للبحث الاحتياطي
+        if len(urls) >= 4:
+            break
+
+    logger.info(f"تم العثور على {len(urls)} رابط صورة للمنتج.")
+    return urls, product_name
 
 
 def download_image(url: str, timeout: int = 12) -> Optional[bytes]:
@@ -384,10 +429,13 @@ def run_full_pipeline(
 
     _notify(f"🔍 البحث عن صور الباركود: {barcode}...")
 
-    # 1. البحث عن الصور
-    urls = search_images_by_barcode(barcode, extra_keywords, max_results=12)
+    # 1. البحث عن الصور واسم المنتج
+    urls, product_name = search_images_by_barcode(barcode, extra_keywords, max_results=12)
+    if product_name:
+        _notify(f"🏷️ تم التعرف على المنتج: <b>{product_name}</b>")
+
     if not urls:
-        return {"status": "error", "barcode": barcode, "images": [], "error": "لم يتم العثور على صور لهذا الباركود"}
+        return {"status": "error", "barcode": barcode, "product_name": product_name, "images": [], "error": "لم يتم العثور على صور لهذا الباركود"}
 
     # 2. تنزيل أفضل الصور
     _notify(f"⬇️ جاري تنزيل الصور ({len(urls)} رابط متاح)...")
@@ -439,6 +487,7 @@ def run_full_pipeline(
     return {
         "status": "success",
         "barcode": barcode,
+        "product_name": product_name,
         "images": results,
         "error": None
     }
