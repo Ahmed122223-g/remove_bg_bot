@@ -571,8 +571,7 @@ def process_excel_batch(chat_id: int, file_bytes: bytes, filename: str):
 
         temp_dir = tempfile.mkdtemp(prefix="excel_batch_")
         cfg = get_user_config(chat_id)
-        user_logo = user_logos.get(chat_id)
-        logo_path = user_logo if (user_logo and os.path.exists(user_logo)) else (LOGO_PATH if os.path.exists(LOGO_PATH) else None)
+        logo_path = LOGO_PATH if os.path.exists(LOGO_PATH) else None
 
         try:
             wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
