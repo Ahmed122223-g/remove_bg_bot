@@ -46,17 +46,19 @@ from image_pipeline import run_full_pipeline
 # مسار ملف اللوجو الافتراضي
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 
-# إعدادات Batch processing من شيتات Excel
+# إعدادات معالجة صور منتجات الباركود المعتمدة للمتاجر
 BATCH_SETTINGS = {
-    "max_per_barcode": 4,    # عدد الصور الأقصى لكل باركود
-    "remove_bg": True,       # عزل الخلفية
-    "add_logo": True,        # إضافة اللوجو
-    "crop_resize": True,     # القص والضبط
-    "optimize": True,        # الضغط والتحسين
-    "logo_position": "bottom_right",
-    "logo_opacity": 0.85,
-    "target_size": (1000, 1000),
-    "max_size_kb": 250,
+    "max_per_barcode": 4,          # عدد الصور الأقصى لكل باركود
+    "remove_bg": True,             # عزل الخلفية (خلفية بيضاء نقية #FFFFFF)
+    "add_logo": True,              # إضافة اللوجو
+    "crop_resize": True,           # القص والضبط
+    "optimize": True,              # الضغط والتحسين
+    "logo_position": "bottom_right", # وضع الشعار في الزاوية السفلى اليمنى
+    "logo_opacity": 0.85,          # شفافية مريحة وواضحة
+    "target_size": (800, 800),     # الأبعاد المعتمدة 800×800 بكسل
+    "target_format": "webp",       # الصيغة الأساسية WebP
+    "min_size_kb": 70,             # الحجم الأدنى المستهدف
+    "max_size_kb": 150,            # الحجم الأقصى المستهدف (150 كيلوبايت)
 }
 
 # حالة المستخدمين أثناء عمليات المعالجة الطويلة (Batch)
@@ -497,6 +499,8 @@ def process_barcode(chat_id: int, barcode: str, extra_keywords: str = ""):
             logo_position=BATCH_SETTINGS["logo_position"],
             logo_opacity=BATCH_SETTINGS["logo_opacity"],
             target_size=BATCH_SETTINGS["target_size"],
+            target_format=BATCH_SETTINGS["target_format"],
+            min_size_kb=BATCH_SETTINGS["min_size_kb"],
             max_size_kb=BATCH_SETTINGS["max_size_kb"],
             max_images=BATCH_SETTINGS["max_per_barcode"],
             status_callback=notify
@@ -517,7 +521,7 @@ def process_barcode(chat_id: int, barcode: str, extra_keywords: str = ""):
         bot.send_message(
             chat_id,
             f"✅ <b>تمت معالجة الباركود:</b> <code>{barcode}</code>{prod_info}\n"
-            f"📦 عدد الصور: {len(images)} صورة جاهزة للرفع على المتاجر"
+            f"📦 عدد الصور: {len(images)} صورة WebP جاهزة للرفع على المتاجر"
         )
 
         for idx, img_data in enumerate(images, 1):
@@ -535,8 +539,8 @@ def process_barcode(chat_id: int, barcode: str, extra_keywords: str = ""):
                     doc_file,
                     caption=(
                         f"📦 <b>باركود:</b> <code>{barcode}</code> | <b>صورة {idx}/{len(images)}</b>\n"
-                        f"💾 الحجم: <b>{size_kb} كيلوبايت</b>\n"
-                        f"📐 الأبعاد: 1000×1000 بكسل"
+                        f"💾 الحجم: <b>{size_kb} كيلوبايت</b> (WebP)\n"
+                        f"📐 الأبعاد: 800×800 بكسل | ⚪ خلفية بيضاء نقية"
                     ),
                     reply_markup=make_action_markup(img_token, cfg.get("model", "u2net"))
                 )

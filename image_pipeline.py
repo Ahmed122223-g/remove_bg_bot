@@ -26,14 +26,16 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# أبعاد المنتج الموحدة المطلوبة للمتاجر الإلكترونية
-TARGET_SIZE = (1000, 1000)
+# أبعاد المنتج الموحدة المطلوبة للمتاجر الإلكترونية (800×800 بكسل)
+TARGET_SIZE = (800, 800)
 
-# نسبة ظهور اللوجو من حجم الصورة (0.18 = 18%)
-LOGO_RATIO = 0.18
+# نسبة ظهور اللوجو من عرض الصورة (0.12 = 12% حجم صغير أنيق وغير مزعج)
+LOGO_RATIO = 0.12
 
-# جودة الضغط (1-95)
-JPEG_QUALITY = 82
+# الحجم المستهدف بالكيلوبايت (بين 70 و 150 كيلوبايت)
+TARGET_MIN_KB = 70
+TARGET_MAX_KB = 150
+DEFAULT_WEBP_QUALITY = 88
 
 
 # ===========================================================================
@@ -342,46 +344,69 @@ def crop_and_resize(
 
 def optimize_image(
     image_bytes: bytes,
-    max_size_kb: int = 250,
-    quality: int = JPEG_QUALITY
+    target_format: str = "webp",
+    min_size_kb: int = TARGET_MIN_KB,
+    max_size_kb: int = TARGET_MAX_KB,
+    initial_quality: int = DEFAULT_WEBP_QUALITY
 ) -> Tuple[bytes, str]:
     """
-    ضغط وتحسين الصورة لأصغر حجم ممكن بجودة بصرية مقبولة للمتاجر الإلكترونية.
+    ضغط وتحسين الصورة لتناسب المتاجر الإلكترونية بدقة عالية وحجم مثالي:
+    - الصيغة الأساسية: WebP (أو JPEG إذا طلبت)
+    - الحجم المستهدف: بين 70 و 150 كيلوبايت كحد أقصى للصورة
+    - الجودة البصرية: عالية جداً بدون تشويش أو ضبابية
 
-    الاستراتيجية:
-    - يجرب حفظ كـ JPEG أولاً (أفضل ضغطاً للمنتجات ذات الخلفية البيضاء الصلبة)
-    - إذا كانت الصورة بخلفية شفافة يحفظ كـ PNG مع ضغط كامل (compress_level=9)
-    - يخفض الجودة تدريجياً حتى يصل للحجم المطلوب
-
-    المخرجات: (بايتات الصورة المضغوطة، الامتداد 'jpg' أو 'png')
+    المخرجات: (بايتات الصورة المضغوطة، الامتداد 'webp' أو 'jpg')
     """
     img = Image.open(io.BytesIO(image_bytes))
+
+    # إذا كانت الصورة شفافة ونريد الاحتفاظ بالشفافية
     has_transparency = img.mode in ("RGBA", "LA") or (
         img.mode == "P" and "transparency" in img.info
     )
 
-    if has_transparency:
-        # تصدير PNG مضغوط
-        out = io.BytesIO()
-        img.convert("RGBA").save(out, format="PNG", optimize=True, compress_level=9)
-        out.seek(0)
-        return out.read(), "png"
+    fmt = target_format.upper()
+    if fmt == "WEBP":
+        ext = "webp"
+    else:
+        ext = "jpg"
+        fmt = "JPEG"
 
-    # تحويل إلى RGB وحفظ JPEG
-    rgb = img.convert("RGB")
-    q = quality
-    while q >= 55:
+    # خلفية بيضاء نقية موحدة Pure White #FFFFFF
+    if img.mode != "RGB":
+        white_bg = Image.new("RGB", img.size, (255, 255, 255))
+        if has_transparency:
+            white_bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[3])
+        else:
+            white_bg.paste(img)
+        rgb_img = white_bg
+    else:
+        rgb_img = img
+
+    # التدرج في ضبط الجودة للوصول لحجم بين 70KB و 150KB
+    best_bytes = None
+    best_size_kb = 0
+
+    # نبدأ بجودة عالية ونخفض تدريجياً إذا تجاوزت 150KB
+    q = initial_quality
+    while q >= 45:
         out = io.BytesIO()
-        rgb.save(out, format="JPEG", quality=q, optimize=True, progressive=True, subsampling=0)
+        if fmt == "WEBP":
+            rgb_img.save(out, format="WEBP", quality=q, method=6)
+        else:
+            rgb_img.save(out, format="JPEG", quality=q, optimize=True, progressive=True, subsampling=0)
+
         size_kb = out.tell() / 1024
-        if size_kb <= max_size_kb or q == 55:
-            out.seek(0)
-            logger.info(f"الصورة محسوّنة: {size_kb:.1f} كيلوبايت (جودة {q}%)")
-            return out.read(), "jpg"
-        q -= 5
+        best_bytes = out.getvalue()
+        best_size_kb = size_kb
 
-    out.seek(0)
-    return out.read(), "jpg"
+        # إذا أصبح الحجم ضمن النطاق المقبول (أقل من أو يساوي 150KB)
+        if size_kb <= max_size_kb:
+            logger.info(f"الصورة محسوّنة {fmt}: {size_kb:.1f} كيلوبايت (جودة {q}%)")
+            return best_bytes, ext
+
+        q -= 4
+
+    return best_bytes, ext
 
 
 # ===========================================================================
@@ -398,7 +423,9 @@ def run_full_pipeline(
     logo_position: str = "bottom_right",
     logo_opacity: float = 0.85,
     target_size: Tuple[int, int] = TARGET_SIZE,
-    max_size_kb: int = 250,
+    target_format: str = "webp",
+    min_size_kb: int = TARGET_MIN_KB,
+    max_size_kb: int = TARGET_MAX_KB,
     max_images: int = 4,
     status_callback=None
 ) -> Dict:
@@ -471,8 +498,13 @@ def run_full_pipeline(
             )
 
         # 6. الضغط والتحسين
-        _notify(f"💾 ضغط وتحسين (صورة {idx})...")
-        final_bytes, final_ext = optimize_image(current, max_size_kb=max_size_kb)
+        _notify(f"💾 ضغط وتحسين إلى WebP (صورة {idx})...")
+        final_bytes, final_ext = optimize_image(
+            current,
+            target_format=target_format,
+            min_size_kb=min_size_kb,
+            max_size_kb=max_size_kb
+        )
         size_kb = len(final_bytes) / 1024
 
         results.append({
